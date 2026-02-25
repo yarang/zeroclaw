@@ -2659,6 +2659,31 @@ pub async fn run(
         );
     }
 
+    // ── Agent Registry (file-based agent definitions) ───────────────
+    let agent_registry = match crate::agent::AgentRegistry::from_workspace_dir(&config.workspace_dir) {
+        Ok(registry) => {
+            let registry = Arc::new(registry);
+            match registry.discover() {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "Loaded agent definitions from registry");
+                        for id in registry.list() {
+                            tracing::debug!(agent_id = %id, "Registered agent");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to discover agent definitions");
+                }
+            }
+            Some(registry)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create agent registry");
+            None
+        }
+    };
+
     // ── Tools (including memory tools and peripherals) ────────────
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -2668,7 +2693,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let mut tools_registry = tools::all_tools_with_runtime_and_registry(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2681,6 +2706,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        agent_registry.as_ref(),
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -3124,6 +3150,28 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
     )?);
 
+    // ── Agent Registry (file-based agent definitions) ───────────────
+    let agent_registry = match crate::agent::AgentRegistry::from_workspace_dir(&config.workspace_dir) {
+        Ok(registry) => {
+            let registry = Arc::new(registry);
+            match registry.discover() {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "Loaded agent definitions from registry");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to discover agent definitions");
+                }
+            }
+            Some(registry)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create agent registry");
+            None
+        }
+    };
+
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -3132,7 +3180,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let mut tools_registry = tools::all_tools_with_runtime_and_registry(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3145,6 +3193,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        agent_registry.as_ref(),
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;

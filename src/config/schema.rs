@@ -3744,6 +3744,51 @@ impl Config {
         }
     }
 
+    /// Load agent definitions from the agents directory and merge with config agents.
+    ///
+    /// This method discovers YAML agent definition files in the workspace's `agents/`
+    /// directory and adds them to the `config.agents` HashMap. Agents defined in the
+    /// config file take precedence over file-based agents with the same ID.
+    pub async fn load_agents_from_registry(&mut self) -> Result<usize> {
+        use crate::agent::AgentRegistry;
+        use crate::security::SecurityPolicy;
+        use std::sync::Arc;
+
+        let agents_dir = self.workspace_dir.join("agents");
+        let security = Arc::new(SecurityPolicy::default());
+        let registry = AgentRegistry::new(agents_dir, security)?;
+
+        match registry.discover() {
+            Ok(count) => {
+                if count > 0 {
+                    let file_agents = registry.all_as_delegate_configs();
+                    let mut merged_count = 0;
+
+                    for (id, agent_config) in file_agents {
+                        // Config-defined agents take precedence
+                        if !self.agents.contains_key(&id) {
+                            self.agents.insert(id, agent_config);
+                            merged_count += 1;
+                        }
+                    }
+
+                    tracing::info!(
+                        total = count,
+                        merged = merged_count,
+                        "Loaded agent definitions from registry"
+                    );
+                    Ok(merged_count)
+                } else {
+                    Ok(0)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to discover agent definitions: {}", e);
+                Ok(0)
+            }
+        }
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch

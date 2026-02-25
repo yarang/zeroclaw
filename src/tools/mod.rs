@@ -27,6 +27,8 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+#[cfg(test)]
+pub mod delegate_tests;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -91,6 +93,7 @@ pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
+use crate::providers;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -180,6 +183,179 @@ pub fn all_tools(
         fallback_api_key,
         root_config,
     )
+}
+
+/// Create full tool registry including memory tools, optional Composio, and agent registry support.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn all_tools_with_runtime_and_registry(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, DelegateAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &crate::config::Config,
+    agent_registry: Option<&std::sync::Arc<crate::agent::AgentRegistry>>,
+) -> Vec<Box<dyn Tool>> {
+    let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(FileReadTool::new(security.clone())),
+        Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(GlobSearchTool::new(security.clone())),
+        Arc::new(ContentSearchTool::new(security.clone())),
+        Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(CronListTool::new(config.clone())),
+        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(ModelRoutingConfigTool::new(
+            config.clone(),
+            security.clone(),
+        )),
+        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
+        Arc::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
+        Arc::new(PushoverTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
+    ];
+
+    if browser_config.enabled {
+        // Add legacy browser_open tool for simple URL opening
+        tool_arcs.push(Arc::new(BrowserOpenTool::new(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+        )));
+        // Add full browser automation tool (pluggable backend)
+        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.session_name.clone(),
+            browser_config.backend.clone(),
+            browser_config.native_headless,
+            browser_config.native_webdriver_url.clone(),
+            browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
+        )));
+    }
+
+    if http_config.enabled {
+        tool_arcs.push(Arc::new(HttpRequestTool::new(
+            security.clone(),
+            http_config.allowed_domains.clone(),
+            http_config.max_response_size,
+            http_config.timeout_secs,
+        )));
+    }
+
+    // Web search tool (enabled by default for GLM and other models)
+    if root_config.web_search.enabled {
+        tool_arcs.push(Arc::new(WebSearchTool::new(
+            root_config.web_search.provider.clone(),
+            root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.max_results,
+            root_config.web_search.timeout_secs,
+        )));
+    }
+
+    // PDF extraction (feature-gated at compile time via rag-pdf)
+    tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+
+    // Vision tools are always available
+    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
+    tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    if let Some(key) = composio_key {
+        if !key.is_empty() {
+            tool_arcs.push(Arc::new(ComposioTool::new(
+                key,
+                composio_entity_id,
+                security.clone(),
+            )));
+        }
+    }
+
+    // Add delegation tool when agents are configured
+    // Combine config agents with registry agents (registry takes precedence)
+    let has_agents = !agents.is_empty() || agent_registry.is_some_and(|r| r.count() > 0);
+
+    if has_agents {
+        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+            let trimmed_value = value.trim();
+            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+        });
+        let parent_tools = Arc::new(tool_arcs.clone());
+
+        // Build delegate tool with registry support
+        let delegate_tool = if let Some(registry) = agent_registry {
+            // Use registry-based delegate tool
+            let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                zeroclaw_dir: root_config
+                    .config_path
+                    .parent()
+                    .map(std::path::PathBuf::from),
+                secrets_encrypt: root_config.secrets.encrypt,
+                reasoning_enabled: root_config.runtime.reasoning_enabled,
+            };
+            DelegateTool::with_registry_and_fallback_and_options(
+                registry.clone(),
+                agents.clone(),
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+            )
+        } else {
+            // Use config-based delegate tool
+            let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.clone()))
+                .collect();
+            DelegateTool::new_with_options(
+                delegate_agents,
+                delegate_fallback_credential,
+                security.clone(),
+                crate::providers::ProviderRuntimeOptions {
+                    auth_profile_override: None,
+                    zeroclaw_dir: root_config
+                        .config_path
+                        .parent()
+                        .map(std::path::PathBuf::from),
+                    secrets_encrypt: root_config.secrets.encrypt,
+                    reasoning_enabled: root_config.runtime.reasoning_enabled,
+                },
+            )
+        };
+
+        let delegate_tool = delegate_tool
+            .with_parent_tools(parent_tools)
+            .with_multimodal_config(root_config.multimodal.clone());
+        tool_arcs.push(Arc::new(delegate_tool));
+    }
+
+    boxed_registry_from_arcs(tool_arcs)
 }
 
 /// Create full tool registry including memory tools and optional Composio.

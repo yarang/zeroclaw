@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::AgentRegistry;
 use crate::config::DelegateAgentConfig;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
@@ -20,8 +21,15 @@ const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
 /// summarization) to purpose-built sub-agents.
+///
+/// The tool supports two agent configuration sources:
+/// 1. Dynamic loading from `AgentRegistry` (file-based agent definitions)
+/// 2. Static fallback configuration (from config file, for backward compatibility)
 pub struct DelegateTool {
-    agents: Arc<HashMap<String, DelegateAgentConfig>>,
+    /// Optional agent registry for dynamic agent loading
+    registry: Option<Arc<AgentRegistry>>,
+    /// Static agent configuration fallback (for backward compatibility)
+    fallback_agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
     /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
@@ -36,17 +44,79 @@ pub struct DelegateTool {
 }
 
 impl DelegateTool {
+    /// Create a new DelegateTool with static agent configuration (backward compatible).
     pub fn new(
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
     ) -> Self {
-        Self::new_with_options(
-            agents,
-            fallback_credential,
+        Self {
+            registry: None,
+            fallback_agents: Arc::new(agents),
             security,
-            providers::ProviderRuntimeOptions::default(),
-        )
+            fallback_credential,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            depth: 0,
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
+        }
+    }
+
+    /// Create a new DelegateTool with agent registry support.
+    pub fn with_registry(
+        registry: Arc<AgentRegistry>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        Self {
+            registry: Some(registry),
+            fallback_agents: Arc::new(HashMap::new()),
+            security,
+            fallback_credential,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            depth: 0,
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
+        }
+    }
+
+    /// Create a new DelegateTool with both registry and static fallback.
+    pub fn with_registry_and_fallback(
+        registry: Arc<AgentRegistry>,
+        fallback_agents: HashMap<String, DelegateAgentConfig>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        Self {
+            registry: Some(registry),
+            fallback_agents: Arc::new(fallback_agents),
+            security,
+            fallback_credential,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            depth: 0,
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
+        }
+    }
+
+    /// Create a new DelegateTool with both registry and static fallback, plus provider options.
+    pub fn with_registry_and_fallback_and_options(
+        registry: Arc<AgentRegistry>,
+        fallback_agents: HashMap<String, DelegateAgentConfig>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
+    ) -> Self {
+        Self {
+            registry: Some(registry),
+            fallback_agents: Arc::new(fallback_agents),
+            security,
+            fallback_credential,
+            provider_runtime_options,
+            depth: 0,
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
+        }
     }
 
     pub fn new_with_options(
@@ -56,7 +126,8 @@ impl DelegateTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
-            agents: Arc::new(agents),
+            registry: None,
+            fallback_agents: Arc::new(agents),
             security,
             fallback_credential,
             provider_runtime_options,
@@ -75,13 +146,16 @@ impl DelegateTool {
         security: Arc<SecurityPolicy>,
         depth: u32,
     ) -> Self {
-        Self::with_depth_and_options(
-            agents,
-            fallback_credential,
+        Self {
+            registry: None,
+            fallback_agents: Arc::new(agents),
             security,
+            fallback_credential,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             depth,
-            providers::ProviderRuntimeOptions::default(),
-        )
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
+        }
     }
 
     pub fn with_depth_and_options(
@@ -92,7 +166,8 @@ impl DelegateTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
-            agents: Arc::new(agents),
+            registry: None,
+            fallback_agents: Arc::new(agents),
             security,
             fallback_credential,
             provider_runtime_options,
@@ -113,6 +188,44 @@ impl DelegateTool {
         self.multimodal_config = config;
         self
     }
+
+    /// Get the agent registry if configured.
+    pub fn registry(&self) -> Option<&Arc<AgentRegistry>> {
+        self.registry.as_ref()
+    }
+
+    /// Get all available agent names (from both registry and fallback).
+    fn list_available_agents(&self) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+
+        // Add names from registry
+        if let Some(registry) = &self.registry {
+            for name in registry.list() {
+                names.insert(name);
+            }
+        }
+
+        // Add names from fallback
+        for name in self.fallback_agents.keys() {
+            names.insert(name.clone());
+        }
+
+        names.into_iter().collect()
+    }
+
+    /// Look up an agent configuration by name.
+    /// Checks registry first, then fallback configuration.
+    fn lookup_agent(&self, name: &str) -> Option<DelegateAgentConfig> {
+        // First check registry
+        if let Some(registry) = &self.registry {
+            if let Some(def) = registry.get(name) {
+                return Some((&def).into());
+            }
+        }
+
+        // Then check fallback
+        self.fallback_agents.get(name).cloned()
+    }
 }
 
 #[async_trait]
@@ -128,7 +241,7 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let agent_names = self.list_available_agents();
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -194,12 +307,11 @@ impl Tool for DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
-        // Look up agent config
-        let agent_config = match self.agents.get(agent_name) {
+        // Look up agent config (checks registry first, then fallback)
+        let agent_config = match self.lookup_agent(agent_name) {
             Some(cfg) => cfg,
             None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+                let available = self.list_available_agents();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -280,7 +392,7 @@ impl Tool for DelegateTool {
             return self
                 .execute_agentic(
                     agent_name,
-                    agent_config,
+                    &agent_config,
                     &*provider,
                     &full_prompt,
                     temperature,
@@ -1095,5 +1207,90 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("provider boom"));
+    }
+
+    // Registry integration tests
+
+    #[test]
+    fn list_available_agents_from_fallback_only() {
+        let agents = sample_agents();
+        let tool = DelegateTool::new(agents, None, test_security());
+
+        let names = tool.list_available_agents();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"researcher".to_string()));
+        assert!(names.contains(&"coder".to_string()));
+    }
+
+    #[test]
+    fn lookup_agent_from_fallback() {
+        let agents = sample_agents();
+        let tool = DelegateTool::new(agents, None, test_security());
+
+        let config = tool.lookup_agent("researcher");
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().provider, "ollama");
+    }
+
+    #[test]
+    fn lookup_agent_returns_none_for_unknown() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+
+        let config = tool.lookup_agent("unknown");
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn schema_includes_fallback_agents() {
+        let agents = sample_agents();
+        let tool = DelegateTool::new(agents, None, test_security());
+
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(desc.contains("researcher") || desc.contains("coder"));
+    }
+
+    #[test]
+    fn empty_agents_list_shows_none_configured() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(desc.contains("none configured"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_fallback_agent() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test".to_string(),
+            DelegateAgentConfig {
+                provider: "invalid-for-test".to_string(),
+                model: "test".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+
+        let tool = DelegateTool::new(agents, None, test_security());
+        let result = tool
+            .execute(json!({"agent": "test", "prompt": "hello"}))
+            .await
+            .unwrap();
+
+        // Should fail at provider creation, not agent lookup
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Failed to create provider"));
     }
 }

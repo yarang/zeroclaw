@@ -49,6 +49,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 }
 
 mod agent;
+mod agent_cli;
 mod approval;
 mod auth;
 mod channels;
@@ -87,8 +88,8 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
-    PeripheralCommands, ServiceCommands, SkillCommands,
+    AgentCommands, ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands,
+    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -182,6 +183,24 @@ Examples:
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
         peripheral: Vec<String>,
+    },
+
+    /// Manage agent definitions (list, show, reload, run)
+    #[command(long_about = "\
+Manage agent definitions.
+
+List, show details, reload, and run pre-defined agent configurations \
+from the agents directory. Agent definitions are YAML files that \
+specify provider, tools, system prompts, and execution settings.
+
+Examples:
+  zeroclaw agents list
+  zeroclaw agents show researcher
+  zeroclaw agents reload
+  zeroclaw agents run researcher \"What is quantum computing?\"")]
+    Agents {
+        #[command(subcommand)]
+        agent_command: AgentCommands,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -674,6 +693,11 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
 
+    // Load agent definitions from workspace agents directory
+    if let Err(e) = config.load_agents_from_registry().await {
+        tracing::warn!("Failed to load agent definitions from registry: {}", e);
+    }
+
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
         Commands::Completions { .. } => unreachable!(),
@@ -695,6 +719,10 @@ async fn main() -> Result<()> {
         )
         .await
         .map(|_| ()),
+
+        Commands::Agents { agent_command } => {
+            agent_cli::handle_command(agent_command, &config).await
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
